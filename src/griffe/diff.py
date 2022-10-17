@@ -144,7 +144,7 @@ class ClassRemovedBaseBreakage(Breakage):
 
 # TODO: decorators!
 def _class_incompatibilities(old_class: Class, new_class: Class, ignore_private: bool = True) -> Iterable[Breakage]:
-    yield from ()  # noqa WPS353
+    yield from ()  # noqa: WPS353
     if new_class.bases != old_class.bases:
         if len(new_class.bases) < len(old_class.bases):
             yield ClassRemovedBaseBreakage(new_class, old_class.bases, new_class.bases)

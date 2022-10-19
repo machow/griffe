@@ -28,7 +28,7 @@ class BreakageKind(enum.Enum):
     PARAMETER_ADDED_REQUIRED: str = "Required parameter was added"
     RETURN_CHANGED_TYPE: str = "Return types are incompatible"
     OBJECT_REMOVED: str = "Public name has been removed or changed"
-    OBJECT_CHANGED_TYPE: str = "Public name points to a different type of object"
+    OBJECT_CHANGED_KIND: str = "Public name points to a different kind of object"
     ATTRIBUTE_CHANGED_TYPE: str = "Attribute types are incompatible"
     ATTRIBUTE_CHANGED_VALUE: str = "Attribute value was changed"
     CLASS_REMOVED_BASE: str = "Base class was removed"
@@ -68,6 +68,23 @@ class Breakage:
             f"\n  Old value: {self.old_value}"
             f"\n  New value: {self.new_value}"
         )
+
+    def as_dict(self, full: bool = False, **kwargs: Any) -> dict[str, Any]:
+        """Return this object's data as a dictionary.
+
+        Parameters:
+            full: Whether to return full info, or just base info.
+            **kwargs: Additional serialization options.
+
+        Returns:
+            A dictionary.
+        """
+        return {
+            "kind": self.kind,
+            "object_path": self.obj.path,
+            "old_value": self.old_value,
+            "new_value": self.new_value,
+        }
 
 
 class ParameterMovedBreakage(Breakage):
@@ -121,7 +138,7 @@ class ObjectRemovedBreakage(Breakage):
 class ObjectChangedKindBreakage(Breakage):
     """Specific breakage class for objects whose kind changed."""
 
-    kind: BreakageKind = BreakageKind.OBJECT_CHANGED_TYPE
+    kind: BreakageKind = BreakageKind.OBJECT_CHANGED_KIND
 
 
 class AttributeChangedTypeBreakage(Breakage):
@@ -219,8 +236,7 @@ def _member_incompatibilities(  # noqa: WPS231
 
         if new_member.kind != old_member.kind:
             yield ObjectChangedKindBreakage(new_member, old_member.kind, new_member.kind)  # type: ignore[arg-type]
-
-        if old_member.is_module:
+        elif old_member.is_module:
             yield from _member_incompatibilities(old_member, new_member, ignore_private=ignore_private)  # type: ignore[arg-type]
         elif old_member.is_class:
             yield from _class_incompatibilities(old_member, new_member, ignore_private=ignore_private)  # type: ignore[arg-type]

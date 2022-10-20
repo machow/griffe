@@ -207,7 +207,10 @@ class Parameter:
         self.default: str | None = default
 
     def __str__(self) -> str:
-        return f"[{self.kind.value}]{self.name}: {self.annotation} = {self.default}"
+        param = f"{self.name}: {self.annotation} = {self.default}"
+        if self.kind:
+            return f"[{self.kind.value}] {param}"
+        return param
 
     def as_dict(self, **kwargs: Any) -> dict[str, Any]:
         """Return this parameter's data as a dictionary.

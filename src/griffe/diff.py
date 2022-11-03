@@ -6,6 +6,7 @@ import builtins
 import contextlib
 import enum
 from typing import Any, Iterable, Iterator, NewType, Union
+from hashlib import sha256
 
 from griffe.dataclasses import Alias, Attribute, Class, Function, Object, Parameter, ParameterKind
 from griffe.expressions import Expression, Name
@@ -22,7 +23,7 @@ class BreakageKind(enum.Enum):
 
     PARAMETER_MOVED: str = "Positional parameter was moved"
     PARAMETER_REMOVED: str = "Parameter was removed"
-    PARAMETER_CHANGED_KIND: str = "Positional parameter was changed to keyword parameter"
+    PARAMETER_CHANGED_KIND: str = "Parameter kind was changed to incompatible kind"
     PARAMETER_CHANGED_DEFAULT: str = "Parameter default was changed"
     PARAMETER_CHANGED_REQUIRED: str = "Parameter is now required"
     PARAMETER_ADDED_REQUIRED: str = "Required parameter was added"
@@ -34,12 +35,40 @@ class BreakageKind(enum.Enum):
     CLASS_REMOVED_BASE: str = "Base class was removed"
 
 
+class Severity(enum.Enum):
+    """An enumeration of the possible breakage severities."""
+
+    VERY_LOW: str = "very low"
+    LOW: str = "low"
+    MEDIUM: str = "medium"
+    HIGH: str = "high"
+    VERY_HIGH: str = "very high"
+
+    def up(self):
+        return {
+            Severity.VERY_LOW: Severity.LOW,
+            Severity.LOW: Severity.MEDIUM,
+            Severity.MEDIUM: Severity.HIGH,
+            Severity.HIGH: Severity.VERY_HIGH,
+            Severity.VERY_HIGH: Severity.VERY_HIGH,
+        }[self]
+
+    def down(self):
+        return {
+            Severity.VERY_LOW: Severity.VERY_LOW,
+            Severity.LOW: Severity.VERY_LOW,
+            Severity.MEDIUM: Severity.LOW,
+            Severity.HIGH: Severity.MEDIUM,
+            Severity.VERY_HIGH: Severity.HIGH,
+        }[self]
+
 class Breakage:
     """Breakages can explain what broke from a version to another."""
 
     kind: BreakageKind
+    default_severity: Severity
 
-    def __init__(self, obj: Object, old_value: Any, new_value: Any) -> None:
+    def __init__(self, obj: Object, old_value: Any, new_value: Any, details: str = "") -> None:
         """Initialize the breakage.
 
         Parameters:
@@ -50,6 +79,7 @@ class Breakage:
         self.obj = obj
         self.old_value = old_value
         self.new_value = new_value
+        self.details = details
 
     def __str__(self) -> str:
         return f"{self.kind.value}"
@@ -57,17 +87,23 @@ class Breakage:
     def __repr__(self) -> str:
         return f"<{self.kind.name}>"
 
+    @property
+    def severity(self) -> Severity:
+        return self.default_severity
+
     def explain(self) -> str:
         """Explain the breakage by showing old and new value.
 
         Returns:
             An explanation.
         """
-        return (
-            f"{self.obj.canonical_path}:{self.obj.lineno}: {self.kind.value}:"
-            f"\n  Old value: {self.old_value}"
-            f"\n  New value: {self.new_value}"
-        )
+        return "\n".join((
+            f"{self.obj.filepath}:{self.obj.lineno}: {self.obj.canonical_path}",
+            f"{self.kind.value} ({self.severity.value} severity):",
+            f"  Old: {self.old_value}",
+            f"  New: {self.new_value}",
+            f"  Details: {self.details}\n" if self.details else "",
+        ))
 
     def as_dict(self, full: bool = False, **kwargs: Any) -> dict[str, Any]:
         """Return this object's data as a dictionary.
@@ -91,72 +127,97 @@ class ParameterMovedBreakage(Breakage):
     """Specific breakage class for moved parameters."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_MOVED
+    default_severity: Severity = Severity.VERY_HIGH
+    explanation: str = "The severity is {} because moving a parameter "
+    "can silently break your users' code "
+    "and lead to incorrect behavior without errors, "
+    "making it harder to detect and fix potential issues."
+
+    @property
+    def severity(self) -> Severity:
+        if self.old_value.default is None:
+            return self.default_severity.up()
 
 
 class ParameterRemovedBreakage(Breakage):
     """Specific breakage class for removed parameters."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_REMOVED
+    default_severity: Severity = Severity.MEDIUM
+    explanation: str = "The severity is {} because removing a non-required parameter "
+    "is an immediate (though visible) breakage for a part of your users' code."
 
 
 class ParameterChangedKindBreakage(Breakage):
     """Specific breakage class for parameters whose kind changed."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_CHANGED_KIND
+    default_severity: Severity = Severity.MEDIUM
+    explanation: str = "The severity is {} because changing the kind of a parameter "
+    "(to positional/keyword -only) is an immediate (though visible) breakage for a part of your users' code."
 
 
 class ParameterChangedDefaultBreakage(Breakage):
     """Specific breakage class for parameters whose default value changed."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_CHANGED_DEFAULT
+    default_severity: Severity = Severity.VERY_HIGH
 
 
 class ParameterChangedRequiredBreakage(Breakage):
     """Specific breakage class for parameters which became required."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_CHANGED_REQUIRED
+    default_severity: Severity = Severity.MEDIUM
 
 
 class ParameterAddedRequiredBreakage(Breakage):
     """Specific breakage class for new parameters added as required."""
 
     kind: BreakageKind = BreakageKind.PARAMETER_ADDED_REQUIRED
+    default_severity: Severity = Severity.HIGH
 
 
 class ReturnChangedTypeBreakage(Breakage):
     """Specific breakage class for return values which changed type.."""
 
     kind: BreakageKind = BreakageKind.RETURN_CHANGED_TYPE
+    default_severity: Severity = Severity.MEDIUM
 
 
 class ObjectRemovedBreakage(Breakage):
     """Specific breakage class for removed objects."""
 
     kind: BreakageKind = BreakageKind.OBJECT_REMOVED
+    default_severity: Severity = Severity.MEDIUM
 
 
 class ObjectChangedKindBreakage(Breakage):
     """Specific breakage class for objects whose kind changed."""
 
     kind: BreakageKind = BreakageKind.OBJECT_CHANGED_KIND
+    default_severity: Severity = Severity.LOW
 
 
 class AttributeChangedTypeBreakage(Breakage):
     """Specific breakage class for attributes whose type changed."""
 
     kind: BreakageKind = BreakageKind.ATTRIBUTE_CHANGED_TYPE
+    default_severity: Severity = Severity.VERY_HIGH
 
 
 class AttributeChangedValueBreakage(Breakage):
     """Specific breakage class for attributes whose value changed."""
 
     kind: BreakageKind = BreakageKind.ATTRIBUTE_CHANGED_VALUE
+    default_severity: Severity = Severity.LOW
 
 
 class ClassRemovedBaseBreakage(Breakage):
     """Specific breakage class for removed base classes."""
 
     kind: BreakageKind = BreakageKind.CLASS_REMOVED_BASE
+    default_severity: Severity = Severity.LOW
 
 
 # TODO: decorators!
@@ -175,7 +236,7 @@ def _class_incompatibilities(old_class: Class, new_class: Class, ignore_private:
 def _function_incompatibilities(old_function: Function, new_function: Function) -> Iterator[Breakage]:  # noqa: WPS231
     new_param_names = [param.name for param in new_function.parameters]
 
-    for index, old_param in enumerate(old_function.parameters):
+    for old_index, old_param in enumerate(old_function.parameters):
         if old_param.name not in new_function.parameters:
             yield ParameterRemovedBreakage(new_function, old_param, None)
             continue
@@ -185,10 +246,13 @@ def _function_incompatibilities(old_function: Function, new_function: Function) 
             yield ParameterChangedRequiredBreakage(new_function, old_param, new_param)
 
         if old_param.kind in POSITIONAL:
-            if new_param_names.index(old_param.name) != index:
-                yield ParameterMovedBreakage(new_function, old_param, new_param)
             if new_param.kind not in POSITIONAL:
                 yield ParameterChangedKindBreakage(new_function, old_param, new_param)
+            else:
+                new_index = new_param_names.index(old_param.name)
+                if new_index != old_index:
+                    details = f"position: from {old_index} to {new_index} ({new_index - old_index:+})"
+                    yield ParameterMovedBreakage(new_function, old_param, new_param, details=details)
 
         breakage = ParameterChangedDefaultBreakage(new_function, old_param, new_param)
         try:

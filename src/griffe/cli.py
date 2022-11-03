@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,9 +28,12 @@ from griffe.agents.extensions.base import load_extensions
 from griffe.docstrings.parsers import Parser
 from griffe.encoders import JSONEncoder
 from griffe.exceptions import ExtensionError
-from griffe.loader import GriffeLoader
+from griffe.loader import GriffeLoader, load
 from griffe.logger import get_logger
+from griffe.diff import find_breaking_changes
+from griffe.git import load_git
 
+DEFAULT_LOG_LEVEL = os.getenv("GRIFFE_LOG_LEVEL", "INFO").upper()
 logger = get_logger(__name__)
 
 
@@ -41,6 +45,22 @@ def _print_data(data: str, output_file: str | IO | None):
         if output_file is None:
             output_file = sys.stdout
         print(data, file=output_file)
+
+
+def _get_latest_tag(path: str | Path) -> str:
+    if isinstance(path, str):
+        path = Path(path)
+    if not path.is_dir():
+        path = path.parent
+    return subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"], cwd=path).decode().strip()
+
+
+def _get_repo_root(path: str | Path) -> str:
+    if isinstance(path, str):
+        path = Path(path)
+    if not path.is_dir():
+        path = path.parent
+    return subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=path).decode().strip()
 
 
 def _stats(stats):
@@ -114,7 +134,7 @@ def _load_packages(
     resolve_implicit: bool = False,
     resolve_external: bool = False,
     allow_inspection: bool = True,
-):
+) -> GriffeLoader:
     loader = GriffeLoader(
         extensions=extensions,
         search_paths=search_paths,
@@ -177,13 +197,6 @@ def get_parser() -> argparse.ArgumentParser:
             type=Path,
             help="Paths to search packages into.",
         )
-        search_options.add_argument(
-            "-y",
-            "--sys-path",
-            dest="append_sys_path",
-            action="store_true",
-            help="Whether to append sys.path to search paths specified with -s.",
-        )
         loading_options = subparser.add_argument_group(title="Loading options")
         loading_options.add_argument(
             "-e",
@@ -219,29 +232,12 @@ def get_parser() -> argparse.ArgumentParser:
             default=True,
             help="Disallow inspection of builtin/compiled/not found modules.",
         )
-        docstring_options = subparser.add_argument_group(title="Docstrings options")
-        docstring_options.add_argument(
-            "-d",
-            "--docstyle",
-            dest="docstring_parser",
-            default=None,
-            type=Parser,
-            help="The docstring style to parse.",
-        )
-        docstring_options.add_argument(
-            "-D",
-            "--docopts",
-            dest="docstring_options",
-            default={},
-            type=json.loads,
-            help="The options for the docstring parser.",
-        )
         debug_options = subparser.add_argument_group(title="Debugging options")
         debug_options.add_argument(
             "-L",
             "--log-level",
             metavar="LEVEL",
-            default=os.getenv("GRIFFE_LOG_LEVEL", "INFO").upper(),
+            default=DEFAULT_LOG_LEVEL,
             choices=_level_choices,
             type=str.upper,
             help="Set the log level: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
@@ -254,7 +250,7 @@ def get_parser() -> argparse.ArgumentParser:
         )
 
     # ========= SUBPARSERS ========= #
-    subparsers = parser.add_subparsers(dest="subcommand", title="Commands", metavar="", prog="griffe")
+    subparsers = parser.add_subparsers(dest="subcommand", title="Commands", metavar="COMMAND", prog="griffe", required=True)
 
     def add_subparser(command: str, text: str, **kwargs) -> argparse.ArgumentParser:  # noqa: WPS430 (nested function)
         return subparsers.add_parser(command, add_help=False, help=text, description=text, **kwargs)
@@ -276,7 +272,41 @@ def get_parser() -> argparse.ArgumentParser:
         default=sys.stdout,
         help="Output file. Supports templating to output each package in its own file, with {package}.",
     )
+    dump_options.add_argument(
+        "-d",
+        "--docstyle",
+        dest="docstring_parser",
+        default=None,
+        type=Parser,
+        help="The docstring style to parse.",
+    )
+    dump_options.add_argument(
+        "-D",
+        "--docopts",
+        dest="docstring_options",
+        default={},
+        type=json.loads,
+        help="The options for the docstring parser.",
+    )
+    dump_options.add_argument(
+        "-y",
+        "--sys-path",
+        dest="append_sys_path",
+        action="store_true",
+        help="Whether to append sys.path to search paths specified with -s.",
+    )
     add_common_options(dump_parser)
+
+    # ========= CHECK PARSER ========= #
+    check_parser = add_subparser("check", "Check for API breakages or possible improvements.")
+    check_options = check_parser.add_argument_group(title="Check options")
+    check_options.add_argument(
+        "package", metavar="PACKAGE", help="Package to find, load and check, as path."
+    )
+    check_options.add_argument(
+        "-a", "--against", metavar="REF", nargs=1, help="Git reference (commit, branch, tag) to check against."
+    )
+    add_common_options(check_parser)
 
     return parser
 
@@ -360,6 +390,75 @@ def dump(
     return 0 if len(data_packages) == len(packages) else 1
 
 
+def check(
+    package: str | Path,
+    against: str | None = None,
+    against_path: str | Path | None = None,
+    *,
+    extensions: Sequence[str | dict[str, Any] | Extension | Type[Extension]] | None = None,
+    resolve_aliases: bool = False,
+    resolve_implicit: bool = False,
+    resolve_external: bool = False,
+    search_paths: Sequence[str | Path] | None = None,
+    # append_sys_path: bool = False,
+    allow_inspection: bool = True,
+    stats: bool = False,
+) -> int:
+    """Load packages data and dump it as JSON.
+
+    Parameters:
+        packages: The packages to load and dump.
+        extensions: The extensions to use.
+        search_paths: The paths to search into.
+        allow_inspection: Whether to allow inspecting modules when visiting them is not possible.
+
+    Returns:
+        `0` for success, `1` for failure.
+    """
+    search_paths = list(search_paths) if search_paths else []
+    # if append_sys_path:
+    #     search_paths.extend(sys.path)
+
+    against = against or _get_latest_tag(package)
+    against_path = against_path or package
+    repository = _get_repo_root(against_path)
+
+    try:
+        loaded_extensions = load_extensions(extensions or ())
+    except ExtensionError as error:
+        logger.error(error)
+        return 1
+
+    old_package = load_git(
+        against_path,
+        commit=against,
+        repo=repository,
+        extensions=loaded_extensions,
+        search_paths=search_paths,
+        # resolve_aliases=resolve_aliases,
+        # resolve_implicit=resolve_implicit,
+        # resolve_external=resolve_external,
+        allow_inspection=allow_inspection,
+    )
+    new_package = load(
+        package,
+        try_relative_path=True,
+        extensions=loaded_extensions,
+        search_paths=search_paths,
+        # resolve_aliases=resolve_aliases,
+        # resolve_implicit=resolve_implicit,
+        # resolve_external=resolve_external,
+        allow_inspection=allow_inspection,
+    )
+
+    breakages = list(find_breaking_changes(old_package, new_package))
+    for breakage in breakages:
+        print(breakage.explain(), file=sys.stderr)
+    if breakages:
+        return 1
+    return 0
+
+
 def main(args: list[str] | None = None) -> int:  # noqa: WPS231
     """Run the main program.
 
@@ -376,7 +475,7 @@ def main(args: list[str] | None = None) -> int:  # noqa: WPS231
     opts_dict = opts.__dict__
     subcommand = opts_dict.pop("subcommand")
 
-    log_level = opts_dict.pop("log_level")
+    log_level = opts_dict.pop("log_level", DEFAULT_LOG_LEVEL)
     try:
         level = getattr(logging, log_level)
     except AttributeError:
@@ -389,4 +488,7 @@ def main(args: list[str] | None = None) -> int:  # noqa: WPS231
     else:
         logging.basicConfig(format="%(levelname)-10s %(message)s", level=level)  # noqa: WPS323
 
-    return {"dump": dump}[subcommand](**opts_dict)
+    return {
+        "check": check,
+        "dump": dump,
+    }[subcommand](**opts_dict)

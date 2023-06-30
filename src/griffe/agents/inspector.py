@@ -172,6 +172,7 @@ class Inspector(BaseInspector):
         docstring_options: dict[str, Any] | None = None,
         lines_collection: LinesCollection | None = None,
         modules_collection: ModulesCollection | None = None,
+        strict: bool = False
     ) -> None:
         """Initialize the inspector.
 
@@ -195,12 +196,15 @@ class Inspector(BaseInspector):
         self.docstring_options: dict[str, Any] = docstring_options or {}
         self.lines_collection: LinesCollection = lines_collection or LinesCollection()
         self.modules_collection: ModulesCollection = modules_collection or ModulesCollection()
+        self.strict = strict
 
     def _get_docstring(self, node: ObjectNode) -> Docstring | None:
         try:
             # access `__doc__` directly to avoid taking the `__doc__` attribute from a parent class
             value = getattr(node.obj, "__doc__", None)
         except Exception:  # noqa: BLE001  # getattr can trigger exceptions
+            if self.strict:
+                raise
             return None
         if value is None:
             return None
@@ -211,6 +215,8 @@ class Inspector(BaseInspector):
             cleaned = cleandoc(value)
         except AttributeError:
             # triggered on method descriptors
+            if self.strict:
+                raise
             return None
         return Docstring(
             cleaned,
@@ -402,6 +408,8 @@ class Inspector(BaseInspector):
         try:
             signature = getsignature(node.obj)
         except Exception:  # noqa: BLE001
+            if self.strict:
+                raise
             # so many exceptions can be raised here:
             # AttributeError, NameError, RuntimeError, ValueError, TokenError, TypeError
             parameters = None
@@ -414,7 +422,7 @@ class Inspector(BaseInspector):
             returns = (
                 None
                 if return_annotation is empty
-                else _convert_object_to_annotation(return_annotation, parent=self.current)
+                else _convert_object_to_annotation(return_annotation, parent=self.current, strict=self.strict)
             )
 
         obj: Attribute | Function
@@ -496,10 +504,10 @@ _kind_map = {
 }
 
 
-def _convert_parameter(parameter: SignatureParameter, parent: Module | Class) -> Parameter:
+def _convert_parameter(parameter: SignatureParameter, parent: Module | Class, strict: bool = False) -> Parameter:
     name = parameter.name
     annotation = (
-        None if parameter.annotation is empty else _convert_object_to_annotation(parameter.annotation, parent=parent)
+        None if parameter.annotation is empty else _convert_object_to_annotation(parameter.annotation, parent=parent, strict=strict)
     )
     kind = _kind_map[parameter.kind]
     if parameter.default is empty:
@@ -512,7 +520,7 @@ def _convert_parameter(parameter: SignatureParameter, parent: Module | Class) ->
     return Parameter(name, annotation=annotation, kind=kind, default=default)
 
 
-def _convert_object_to_annotation(obj: Any, parent: Module | Class) -> str | Name | Expression | None:
+def _convert_object_to_annotation(obj: Any, parent: Module | Class, strict: bool = False) -> str | Name | Expression | None:
     # even when *we* import future annotations,
     # the object from which we get a signature
     # can come from modules which did *not* import them,
@@ -528,5 +536,7 @@ def _convert_object_to_annotation(obj: Any, parent: Module | Class) -> str | Nam
     try:
         annotation_node = compile(obj, mode="eval", filename="<>", flags=ast.PyCF_ONLY_AST, optimize=2)
     except SyntaxError:
+        if strict:
+            raise
         return obj
     return safe_get_annotation(annotation_node.body, parent=parent)  # type: ignore[attr-defined]
